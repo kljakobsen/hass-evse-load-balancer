@@ -455,6 +455,7 @@ async def test_station_snaps_below_min_to_zero(station_charger, mock_hass):
 
 async def test_station_resume_kicks_immediately(station_charger, mock_hass, states):
     """Station lever: profile first, then off->on restart."""
+    station_charger._paused_by_us = True  # our own pause
     states[STATUS_CONN] = OcppStatusMap.SuspendedEVSE
     states[STATION] = "0"
     await station_charger.set_current_limit(_limit(10))
@@ -552,6 +553,7 @@ async def test_session_resume_does_not_kick_immediately(
     session_charger, mock_hass, states
 ):
     """Session lever: raise within the transaction, verify later."""
+    session_charger._paused_by_us = True  # our own pause
     states[STATUS_CONN] = OcppStatusMap.SuspendedEVSE
     states[SESSION] = "0"
     await session_charger.set_current_limit(_limit(10))
@@ -562,6 +564,7 @@ async def test_session_resume_does_not_kick_immediately(
 
 async def test_session_resume_without_restart(session_charger, mock_hass, states, fast):
     """If the charger resumes on the TxProfile alone, nothing else happens."""
+    session_charger._paused_by_us = True  # our own pause
     states[STATUS_CONN] = OcppStatusMap.SuspendedEVSE
     states[SESSION] = "0"
     await session_charger.set_current_limit(_limit(10))
@@ -575,6 +578,7 @@ async def test_session_resume_restarts_and_rebinds(
     session_charger, mock_hass, states, fast
 ):
     """Still suspended after the grace: restart, wait for new tx, rebind."""
+    session_charger._paused_by_us = True  # our own pause
     states[STATUS_CONN] = OcppStatusMap.SuspendedEVSE
     states[SESSION] = "0"
     await session_charger.set_current_limit(_limit(10))
@@ -597,6 +601,7 @@ async def test_session_resume_restarts_immediately_once_learned(
 ):
     """After one needed restart, resume skips the grace and the old-tx write."""
     session_charger._resume_needs_restart = True
+    session_charger._paused_by_us = True  # our own pause
     states[STATUS_CONN] = OcppStatusMap.SuspendedEVSE
     states[SESSION] = "0"
     await session_charger.set_current_limit(_limit(10))
@@ -615,11 +620,91 @@ async def test_session_resume_restarts_immediately_once_learned(
     assert _number_calls(mock_hass) == [(SESSION, 10)]
 
 
+async def test_restart_detected_without_transaction_id_change(
+    session_charger, mock_hass, states, fast
+):
+    """ocpp 0.13: the tx-id sensor lags; detect the restart via slider/status."""
+    session_charger._resume_needs_restart = True
+    session_charger._paused_by_us = True  # our own pause
+    states[STATUS_CONN] = OcppStatusMap.SuspendedEVSE
+    states[SESSION] = "0"
+    await session_charger.set_current_limit(_limit(10))
+
+    async def _calls(**kwargs):
+        if kwargs["domain"] == "switch" and kwargs["service"] == "turn_off":
+            states[SESSION] = "unavailable"  # old transaction ended
+            states[STATUS_CONN] = OcppStatusMap.Finishing
+
+    async def _sleep(_seconds):
+        states[SESSION] = "unknown"  # new transaction bound; TX id unchanged
+        states[STATUS_CONN] = OcppStatusMap.Charging
+
+    mock_hass.services.async_call.side_effect = _calls
+    with (
+        patch(f"{MODULE}.asyncio.sleep", new=_sleep),
+        patch(f"{MODULE}._LOGGER") as log,
+    ):
+        await run_scheduled(session_charger)
+    assert _number_calls(mock_hass) == [(SESSION, 10)]
+    log.warning.assert_not_called()
+
+
+async def test_restart_wait_ignores_still_suspended_old_transaction(
+    session_charger, mock_hass, states, fast
+):
+    """No end of the old transaction seen: keep waiting (and warn on timeout)."""
+    states[STATUS_CONN] = OcppStatusMap.SuspendedEVSE
+    states[SESSION] = "0"
+    with patch(f"{MODULE}._LOGGER") as log:
+        await session_charger._wait_for_new_transaction("1001")
+    log.warning.assert_called_once()
+
+
+async def test_no_restart_for_suspension_we_did_not_cause(
+    session_charger, mock_hass, states
+):
+    """SuspendedEVSE from a manual stop / vendor app is not ours to undo."""
+    session_charger._resume_needs_restart = True  # even with a learned restart
+    states[STATUS_CONN] = OcppStatusMap.SuspendedEVSE
+    states[SESSION] = "16"
+    await session_charger.set_current_limit(_limit(10))
+    assert _number_calls(mock_hass) == [(SESSION, 10)]
+    assert _switch_calls(mock_hass) == []
+    assert session_charger._task is None  # no grace-and-restart scheduled
+
+
+async def test_station_no_restart_for_suspension_we_did_not_cause(
+    station_charger, mock_hass, states
+):
+    """Same guard on the station lever."""
+    states[STATUS_CONN] = OcppStatusMap.SuspendedEVSE
+    await station_charger.set_current_limit(_limit(10))
+    assert _number_calls(mock_hass) == [(STATION, 10)]
+    assert _switch_calls(mock_hass) == []
+
+
+async def test_own_pause_then_resume_restarts(station_charger, mock_hass, states):
+    """Pause via the balancer, then resume: the restart still happens."""
+    await station_charger.set_current_limit(_limit(3))
+    states[STATUS_CONN] = OcppStatusMap.SuspendedEVSE
+    await station_charger.set_current_limit(_limit(10))
+    assert _switch_calls(mock_hass) == ["turn_off", "turn_on"]
+
+
+async def test_charging_status_clears_pause_flag(session_charger):
+    """Once the connector is Charging again, no pause of ours is in effect."""
+    session_charger._paused_by_us = True
+    session_charger._on_status_change(_status_event(OcppStatusMap.Charging))
+    assert session_charger._paused_by_us is False
+    assert session_charger._task is None
+
+
 async def test_learned_restart_not_used_for_station_lever(
     station_charger, mock_hass, states
 ):
     """The station lever keeps its immediate restart regardless of the flag."""
     station_charger._resume_needs_restart = True
+    station_charger._paused_by_us = True  # our own pause
     states[STATUS_CONN] = OcppStatusMap.SuspendedEVSE
     states[STATION] = "0"
     await station_charger.set_current_limit(_limit(10))

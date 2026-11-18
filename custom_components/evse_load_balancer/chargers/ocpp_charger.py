@@ -293,7 +293,10 @@ class OcppCharger(HaDevice, Charger):
     @callback
     def _on_status_change(self, event: Event[EventStateChangedData]) -> None:
         """
-        Clear a 0A session limit that would outlive the session.
+        Track the connector status.
+
+        ``Charging`` clears our pause flag. ``Available`` clears a 0A session
+        limit that would outlive the session.
 
         With ocpp's "Send Session Current Limit as a default profile"
         option (>= 0.12.1) the session limit is a TxDefaultProfile that
@@ -303,7 +306,14 @@ class OcppCharger(HaDevice, Charger):
         nothing happens here.
         """
         new_state = event.data["new_state"]
-        if new_state is None or new_state.state != OcppStatusMap.Available:
+        if new_state is None:
+            return
+        if new_state.state == OcppStatusMap.Charging:
+            # Charging again (our resume, a new session, a manual start):
+            # no pause of ours is in effect any more.
+            self._paused_by_us = False
+            return
+        if new_state.state != OcppStatusMap.Available:
             return
         if self._stale_pause_value() is not None:
             self._schedule(self._reset_session_limit("the connector became Available"))
@@ -421,11 +431,18 @@ class OcppCharger(HaDevice, Charger):
             value = 0
 
         value = max(OCPP_HW_MIN_CURRENT, min(value, OCPP_HW_MAX_CURRENT))
+        # Only a suspension we caused is ours to undo. SuspendedEVSE can also
+        # come from a manual stop (it precedes StopTransaction), the vendor
+        # app or a charger schedule; restarting the transaction would
+        # override that.
+        was_paused_by_us = self._paused_by_us
         self._paused_by_us = value == 0
 
         status = self._get_status()
         resuming = (
-            status == OcppStatusMap.SuspendedEVSE and value >= OCPP_CAR_MIN_CURRENT
+            status == OcppStatusMap.SuspendedEVSE
+            and value >= OCPP_CAR_MIN_CURRENT
+            and was_paused_by_us
         )
         lever = self.control_lever
 
@@ -623,12 +640,33 @@ class OcppCharger(HaDevice, Charger):
         await self._bind_session_when_ready(value)
 
     async def _wait_for_new_transaction(self, previous: str | None) -> None:
-        """Wait until the transaction id changes after a restart."""
+        """
+        Wait until the restarted transaction is running.
+
+        Primary signal: the transaction id changes. Fallback, because the
+        transaction id sensor does not always update promptly (seen with
+        ocpp 0.13.0, where it lagged > 30s): the old transaction visibly
+        ended (session slider unavailable, or connector Finishing /
+        Preparing / Available) and a transaction is back (slider available,
+        or connector Charging again).
+        """
         loop = asyncio.get_running_loop()
         deadline = loop.time() + OCPP_NEW_TRANSACTION_TIMEOUT
+        session_id = self._session_entity_id()
+        seen_end = False
         while loop.time() < deadline:
             current = self._transaction_id()
             if current not in _NO_TRANSACTION and current != previous:
+                return
+            status = self._get_status()
+            session_up = session_id is not None and self._entity_available(session_id)
+            if status in (
+                OcppStatusMap.Finishing,
+                OcppStatusMap.Preparing,
+                OcppStatusMap.Available,
+            ) or (session_id is not None and not session_up):
+                seen_end = True
+            elif seen_end and (session_up or status == OcppStatusMap.Charging):
                 return
             await asyncio.sleep(_POLL_INTERVAL)
         _LOGGER.warning(
